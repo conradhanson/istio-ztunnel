@@ -94,11 +94,76 @@ impl RequestParts for Parts {
     }
 }
 
+/// Per-connection CRL revocation enforcement for an inbound HBONE connection.
+/// When present, [`serve_connection`] re-checks the peer's certificate identities against the CRL
+/// on every CRL update and abruptly shuts the connection down (via GOAWAY) if any cert is revoked.
+///
+/// Boxed by the caller and held off to the side so it adds only a pointer to the (size-sensitive)
+/// `serve_connection` future — it is cold state, touched only on a CRL update.
+pub struct ConnectionRevocation {
+    crl_manager: Arc<crate::tls::crl::CrlManager>,
+    metrics: Arc<crate::proxy::Metrics>,
+    /// `(issuer, serial)` of each cert in the peer chain — all we keep to enforce revocation.
+    ids: Vec<crate::tls::CertId>,
+    crl_rx: watch::Receiver<u64>,
+    /// Peer (client) identity, retained only so a revocation termination is attributable in logs.
+    peer_identity: Option<crate::identity::Identity>,
+    /// Flipped to `true` when this connection's cert is revoked, so the per-stream serving futures
+    /// resolve to `Error::CertificateRevoked` and the access log attributes the termination.
+    revoked_tx: watch::Sender<bool>,
+}
+
+impl ConnectionRevocation {
+    /// Captures the peer chain's `(issuer, serial)` identities from the accepted TLS stream and
+    /// subscribes to CRL updates. Returns boxed state to keep the serve future small. Call this
+    /// before `s` is moved into [`serve_connection`]. `revoked_tx` is shared with this connection's
+    /// per-stream futures (its receivers) for access-log attribution.
+    pub fn new(
+        s: &tokio_rustls::server::TlsStream<TcpStream>,
+        crl_manager: Arc<crate::tls::crl::CrlManager>,
+        metrics: Arc<crate::proxy::Metrics>,
+        peer_identity: Option<crate::identity::Identity>,
+        revoked_tx: watch::Sender<bool>,
+    ) -> Box<Self> {
+        let ids = s
+            .get_ref()
+            .1
+            .peer_certificates()
+            .map(crate::tls::chain_cert_ids)
+            .unwrap_or_default();
+        let crl_rx = crl_manager.subscribe();
+        Box::new(Self {
+            crl_manager,
+            metrics,
+            ids,
+            crl_rx,
+            peer_identity,
+            revoked_tx,
+        })
+    }
+}
+
+/// Awaits the next CRL reload. Resolves only when the CRL set was successfully reloaded. With no
+/// CRL configured (`None`), or once the watcher's sender is gone, it never resolves — so the
+/// corresponding `select!` arm stays dormant rather than busy-looping.
+async fn wait_for_crl_change(state: Option<&mut Box<ConnectionRevocation>>) {
+    match state {
+        Some(s) => {
+            if s.crl_rx.changed().await.is_err() {
+                // Sender dropped (shutdown); never resolve again.
+                std::future::pending::<()>().await
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
 pub async fn serve_connection<F, Fut>(
     cfg: Arc<config::Config>,
     s: tokio_rustls::server::TlsStream<TcpStream>,
     drain: DrainWatcher,
     mut force_shutdown: watch::Receiver<()>,
+    mut revocation: Option<Box<ConnectionRevocation>>,
     handler: F,
 ) -> Result<(), Error>
 where
@@ -168,6 +233,29 @@ where
                 debug!("starting graceful drain...");
                 conn.graceful_shutdown();
                 break;
+            }
+            // CRL update: revocation is a security event, so if any cert in this connection's peer
+            // chain is now revoked we abruptly terminate (GOAWAY) rather than gracefully drain.
+            _ = wait_for_crl_change(revocation.as_mut()) => {
+                if let Some(rev) = revocation.as_ref()
+                    && rev.crl_manager.any_revoked(&rev.ids)
+                {
+                    let peer = rev
+                        .peer_identity
+                        .as_ref()
+                        .map_or_else(|| "<unknown>".to_string(), |id| id.to_string());
+                    debug!(
+                        %peer,
+                        "terminating inbound connection: peer certificate revoked by CRL update"
+                    );
+                    rev.metrics
+                        .record_crl_rejection(crate::proxy::metrics::Reporter::destination);
+                    // Notify the per-stream serving futures first so they resolve to
+                    // `CertificateRevoked` (access-log attribution) before the GOAWAY closes them.
+                    let _ = rev.revoked_tx.send(true);
+                    conn.abrupt_shutdown(h2::Reason::NO_ERROR); // maybe INADEQUATE_SECURITY instead?
+                    break;
+                }
             }
         }
     }

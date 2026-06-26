@@ -17,10 +17,12 @@ use notify_debouncer_full::{
     DebounceEventResult, Debouncer, FileIdMap, new_debouncer_opt, notify::RecursiveMode,
 };
 use rustls_pemfile::Item;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 use webpki::{CertRevocationList, OwnedCertRevocationList};
 
@@ -39,8 +41,14 @@ pub enum CrlError {
 #[derive(Clone)]
 /// Both **inbound** and **outbound** mesh TLS verifiers call [`CrlManager::get_crls`] on every
 /// handshake, so CRL file updates apply to new connections immediately.
+///
+/// For *existing* connections, [`CrlManager::subscribe`] hands out a watch receiver that fires on
+/// every successful (re)load, so a watcher can re-evaluate already-open connections against the
+/// updated CRL set.
 pub struct CrlManager {
     inner: Arc<RwLock<CrlManagerInner>>,
+    /// Bumped on every successful CRL (re)load. Subscribers re-evaluate existing connections.
+    notify: Arc<watch::Sender<u64>>,
 }
 
 impl std::fmt::Debug for CrlManager {
@@ -49,10 +57,18 @@ impl std::fmt::Debug for CrlManager {
     }
 }
 
+/// Revoked `(issuer DER → {raw serial})` membership set for existing-connection enforcement.
+/// Built with the same parser (`x509_parser`) used to extract [`crate::tls::CertId`]s from peer
+/// chains, so the issuer/serial byte encodings on both sides match exactly.
+type RevokedSet = HashMap<Vec<u8>, HashSet<Vec<u8>>>;
+
 struct CrlManagerInner {
     /// Pre-parsed CRLs for webpki's RevocationOptionsBuilder, avoiding DER re-parse and mem alloc for every handshake.
     /// None = not loaded, Some = loaded (may be empty).
     crls: Option<Arc<Vec<CertRevocationList<'static>>>>,
+    /// Revoked `(issuer, serial)` membership set, kept in sync with `crls`. Used by
+    /// [`CrlManager::any_revoked`] to check existing connections without re-validating chains.
+    revoked: Option<Arc<RevokedSet>>,
     crl_path: PathBuf,
     // WARNING: must use FileIdMap, NOT NoCache. Kubernetes secret/configmap volume updates
     // use atomic symlink swaps — FileIdMap tracks inode identity across renames so these
@@ -68,9 +84,11 @@ impl CrlManager {
         let manager = Self {
             inner: Arc::new(RwLock::new(CrlManagerInner {
                 crls: None,
+                revoked: None,
                 crl_path: crl_path.clone(),
                 _debouncer: None,
             })),
+            notify: Arc::new(watch::channel(0u64).0),
         };
 
         // try to load the CRL, but don't fail if the file doesn't exist yet
@@ -93,7 +111,23 @@ impl CrlManager {
         Ok(manager)
     }
 
+    /// Returns a watch receiver whose value increments on every successful CRL (re)load.
+    /// Used by the connection manager's CRL watcher to re-evaluate existing connections on update.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.notify.subscribe()
+    }
+
+    /// Reloads the CRL set from disk and, on success, notifies subscribers (so watchers can re-evaluate existing connections).
+    /// Lazy loads from `get_crls` also flow through here, but only fire once since subsequent calls find the CRLs already loaded.
     pub fn load_crl(&self) -> Result<(), CrlError> {
+        let res = self.reload_crl_data();
+        if res.is_ok() {
+            self.notify.send_modify(|v| *v = v.wrapping_add(1));
+        }
+        res
+    }
+
+    fn reload_crl_data(&self) -> Result<(), CrlError> {
         let mut inner = self.inner.write().unwrap();
 
         let data = std::fs::read(&inner.crl_path)?;
@@ -102,6 +136,7 @@ impl CrlManager {
         if data.is_empty() {
             debug!(path = ?inner.crl_path, "crl file is empty, treating as no revocations");
             inner.crls = Some(Arc::new(Vec::new()));
+            inner.revoked = Some(Arc::new(RevokedSet::new()));
             return Ok(());
         }
 
@@ -117,11 +152,13 @@ impl CrlManager {
         if der_crls.is_empty() {
             debug!(path = ?inner.crl_path, "no crl blocks found, treating as no revocations");
             inner.crls = Some(Arc::new(Vec::new()));
+            inner.revoked = Some(Arc::new(RevokedSet::new()));
             return Ok(());
         }
 
         let mut validated_crls: Vec<CertRevocationList<'static>> =
             Vec::with_capacity(der_crls.len());
+        let mut revoked: RevokedSet = HashMap::new();
 
         for (idx, der_data) in der_crls.into_iter().enumerate() {
             // parse with webpki to catch errors early and keep the parsed form for the verifier hot path
@@ -131,10 +168,27 @@ impl CrlManager {
 
             // Owned variant borrows nothing, so the lifetime can be 'static
             validated_crls.push(CertRevocationList::from(owned));
+
+            // Also build the (issuer, serial) membership set for existing-connection enforcement,
+            // using x509_parser so the encodings match `tls::chain_cert_ids`. webpki already
+            // validated the CRL above; if x509_parser disagrees we skip it for membership (new
+            // connections are still enforced via the webpki path) rather than failing the reload.
+            match x509_parser::parse_x509_crl(&der_data) {
+                Ok((_, crl)) => {
+                    let entry = revoked.entry(crl.issuer().as_raw().to_vec()).or_default();
+                    for rc in crl.iter_revoked_certificates() {
+                        entry.insert(rc.raw_serial().to_vec());
+                    }
+                }
+                Err(e) => {
+                    warn!(crl = idx + 1, error = %e, "x509 CRL parse failed; excluded from existing-connection revocation set");
+                }
+            }
         }
 
         let count = validated_crls.len();
         inner.crls = Some(Arc::new(validated_crls));
+        inner.revoked = Some(Arc::new(revoked));
 
         debug!(
             path = ?inner.crl_path,
@@ -182,6 +236,46 @@ impl CrlManager {
         } else {
             Arc::new(Vec::new())
         }
+    }
+
+    /// Returns the revoked `(issuer, serial)` membership set, loading the CRL first if needed.
+    fn get_revoked(&self) -> Arc<RevokedSet> {
+        let inner = self.inner.read().unwrap();
+        if let Some(ref revoked) = inner.revoked {
+            return revoked.clone();
+        }
+        drop(inner);
+        if let Err(e) = self.load_crl() {
+            debug!(error = %e, "failed to load crl");
+            return Arc::new(RevokedSet::new());
+        }
+        let inner = self.inner.read().unwrap();
+        inner
+            .revoked
+            .clone()
+            .unwrap_or_else(|| Arc::new(RevokedSet::new()))
+    }
+
+    /// Returns true if any of `ids` is revoked by a currently-loaded CRL.
+    ///
+    /// Used for CRL enforcement on *existing* connections: a connection retains only the
+    /// [`CertId`](crate::tls::CertId)s of its peer chain and, on a CRL update, checks membership
+    /// here rather than re-validating the whole chain (which cannot have changed apart from
+    /// revocation). The issuer is matched so a serial revoked under one CA cannot false-match a
+    /// certificate issued by another — i.e. this never produces a false revocation.
+    pub fn any_revoked(&self, ids: &[crate::tls::CertId]) -> bool {
+        if ids.is_empty() {
+            return false;
+        }
+        let revoked = self.get_revoked();
+        if revoked.is_empty() {
+            return false;
+        }
+        ids.iter().any(|id| {
+            revoked
+                .get(&id.issuer)
+                .is_some_and(|serials| serials.contains(&id.serial))
+        })
     }
 
     /// starts watching the CRL file for changes.
@@ -286,6 +380,23 @@ mod tests {
 
         let result = CrlManager::new(file.path().to_path_buf());
         assert!(result.is_ok(), "should handle empty CRL file gracefully");
+    }
+
+    #[test]
+    fn test_crl_manager_notifies_subscribers_on_reload() {
+        // An empty file is a valid CRL (no revocations), so load_crl succeeds and must notify.
+        let file = NamedTempFile::new().expect("failed to create temporary test file");
+        let mgr = CrlManager::new(file.path().to_path_buf()).expect("manager");
+
+        let mut rx = mgr.subscribe();
+        // Mark the current version (bumped by the initial load in `new`) as seen.
+        rx.borrow_and_update();
+
+        mgr.load_crl().expect("reload should succeed");
+        assert!(
+            rx.has_changed().expect("sender is alive"),
+            "subscribers should be notified after a successful CRL reload"
+        );
     }
 
     #[test]
