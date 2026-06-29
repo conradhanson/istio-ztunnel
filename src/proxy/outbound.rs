@@ -289,11 +289,20 @@ impl OutboundConnection {
 
             // Spawn inner CONNECT tunnel
             let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+            // Enforce CRL revocation on this inner tunnel for its lifetime
+            let revocation = self.pi.crl_manager.as_ref().map(|crl_manager| {
+                super::h2::client::OutboundConnectionRevocation::new(
+                    &tls_stream,
+                    crl_manager.clone(),
+                    self.pi.metrics.clone(),
+                )
+            });
             let mut sender = super::h2::client::spawn_connection(
                 self.pi.cfg.clone(),
                 tls_stream,
                 drain_rx,
                 wl_key,
+                revocation,
             )
             .await?;
             let origin_network = &self.pi.cfg.network;

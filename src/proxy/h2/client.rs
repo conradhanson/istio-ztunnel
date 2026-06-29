@@ -30,7 +30,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 use tokio::sync::watch::Receiver;
-use tracing::{Instrument, debug, error, trace, warn};
+use tracing::{Instrument, debug, error, info, trace, warn};
 
 #[derive(Debug, Clone)]
 // H2ConnectClient is a wrapper abstracting h2
@@ -145,11 +145,77 @@ impl H2ConnectClient {
     }
 }
 
+/// Per-connection CRL revocation enforcement for an outbound HBONE tunnel. When present,
+/// [`drive_connection`] re-checks the upstream server's certificate identities against the CRL on
+/// every CRL update and abruptly tears the tunnel down if any cert is now revoked.
+///
+/// This mirrors the inbound [`crate::proxy::h2::server::ConnectionRevocation`], minus the
+/// per-stream attribution signal: outbound streams are multiplexed over the pool and fanned out
+/// from the tunnel, so a revoked tunnel surfaces to each downstream connection as a generic stream
+/// reset (the `record_crl_rejection` metric still fires). Boxed so it adds only a pointer to the
+/// connection driver's state.
+pub struct OutboundConnectionRevocation {
+    crl_manager: Arc<crate::tls::crl::CrlManager>,
+    metrics: Arc<crate::proxy::Metrics>,
+    /// `(issuer, serial)` of each cert in the upstream server chain — all we keep to enforce revocation.
+    ids: Vec<crate::tls::CertId>,
+    crl_rx: Receiver<u64>,
+    /// Upstream (server) identity, retained only so a revocation teardown is attributable in logs.
+    peer_identity: Option<Identity>,
+}
+
+impl OutboundConnectionRevocation {
+    /// Captures the upstream server chain's `(issuer, serial)` identities from the established TLS
+    /// stream and subscribes to CRL updates. Call before `s` is moved into [`spawn_connection`].
+    /// Generic over the inner IO so it serves both the pooled tunnel (`TlsStream<TcpStream>`) and
+    /// the double-HBONE inner tunnel (`TlsStream<TokioH2Stream>`).
+    pub fn new<IO>(
+        s: &tokio_rustls::client::TlsStream<IO>,
+        crl_manager: Arc<crate::tls::crl::CrlManager>,
+        metrics: Arc<crate::proxy::Metrics>,
+    ) -> Box<Self> {
+        let (_, conn) = s.get_ref();
+        let ids = conn
+            .peer_certificates()
+            .map(crate::tls::chain_cert_ids)
+            .unwrap_or_default();
+        let peer_identity = crate::tls::identity_from_connection(conn);
+        let crl_rx = crl_manager.subscribe();
+        Box::new(Self {
+            crl_manager,
+            metrics,
+            ids,
+            crl_rx,
+            peer_identity,
+        })
+    }
+}
+
+/// Resolves only when a CRL update actually revokes a cert in this tunnel's upstream chain. CRL
+/// reloads that don't affect this chain are ignored (we keep waiting), so the tunnel is torn down
+/// strictly on revocation. With no CRL configured (`None`), or once the watcher's sender is gone,
+/// it never resolves — the corresponding `select!` arm stays dormant rather than busy-looping.
+async fn wait_for_crl_revocation(state: Option<&mut Box<OutboundConnectionRevocation>>) {
+    match state {
+        Some(s) => loop {
+            if s.crl_rx.changed().await.is_err() {
+                // Sender dropped (shutdown); never resolve again.
+                std::future::pending::<()>().await;
+            }
+            if s.crl_manager.any_revoked(&s.ids) {
+                return;
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
 pub async fn spawn_connection(
     cfg: Arc<config::Config>,
     s: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     driver_drain: Receiver<bool>,
     wl_key: WorkloadKey,
+    revocation: Option<Box<OutboundConnectionRevocation>>,
 ) -> Result<H2ConnectClient, Error> {
     let mut builder = h2::client::Builder::new();
     builder
@@ -180,7 +246,7 @@ pub async fn spawn_connection(
     // it is important to have a drain here, or this connection will never terminate
     tokio::spawn(
         async move {
-            drive_connection(connection, driver_drain).await;
+            drive_connection(connection, driver_drain, revocation).await;
         }
         .in_current_span(),
     );
@@ -194,8 +260,11 @@ pub async fn spawn_connection(
     Ok(c)
 }
 
-async fn drive_connection<S, B>(mut conn: Connection<S, B>, mut driver_drain: Receiver<bool>)
-where
+async fn drive_connection<S, B>(
+    mut conn: Connection<S, B>,
+    mut driver_drain: Receiver<bool>,
+    mut revocation: Option<Box<OutboundConnectionRevocation>>,
+) where
     S: AsyncRead + AsyncWrite + Send + Unpin,
     B: Buf,
 {
@@ -216,6 +285,22 @@ where
         }
         _ = ping_drop_rx => {
             warn!("HBONE ping timeout/error");
+        }
+        // CRL update: revocation is a security event. When a cert in this connection's upstream cert chain is now revoked,
+        //  we tear the tunnel down abruptly so any in-flight streams multiplexed over this tunnel are reset.
+        _ = wait_for_crl_revocation(revocation.as_mut()) => {
+            if let Some(rev) = revocation.as_ref() {
+                let peer = rev
+                    .peer_identity
+                    .as_ref()
+                    .map_or_else(|| "<unknown>".to_string(), |id| id.to_string());
+                info!(
+                    %peer,
+                    "terminating outbound connection: upstream certificate revoked by CRL update"
+                );
+                rev.metrics
+                    .record_crl_rejection(crate::proxy::metrics::Reporter::source);
+            }
         }
         res = conn => {
             match res {

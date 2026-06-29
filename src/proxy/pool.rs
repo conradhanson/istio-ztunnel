@@ -99,11 +99,20 @@ impl ConnSpawner {
             }
         })?;
         trace!("connector connected, handshaking");
+        // Enforce CRL revocation on this tunnel for its whole lifetime
+        let revocation = self.crl_manager.as_ref().map(|crl_manager| {
+            h2::client::OutboundConnectionRevocation::new(
+                &tls_stream,
+                crl_manager.clone(),
+                self.metrics.clone(),
+            )
+        });
         let sender = h2::client::spawn_connection(
             self.cfg.clone(),
             tls_stream,
             self.timeout_rx.clone(),
             key,
+            revocation,
         )
         .await?;
         Ok(sender)
