@@ -99,26 +99,55 @@ enough at our scale.
   access-log/metrics path maps to a `CERT_REVOKED` response flag via the same inference mechanism
   RBAC late-rejection uses — i.e. no special-case conditionals, one shared `handle_connection!`
   termination path with symmetric RBAC and CRL arms.
+- **Attribution is a `biased` race, signal set before teardown.** Both directions race the data
+  future against the shared `await_revocation(rx)` helper; the `select!` is `biased` with the
+  revocation arm first. This is what makes attribution deterministic rather than timing-dependent:
+  the driver flips the revocation signal *before* it tears the connection down (the act that makes
+  the data future fail with a generic reset), so the revocation arm always wins the race when a
+  teardown is due to revocation. The receiver lives on the tunnel handle (`H2ConnectClient`),
+  surfaced from the pool checkout — **not** on the byte-stream `H2Stream`.
+- **Per-connection memory cost of attribution is negligible.** Each active connection holds one
+  `watch::Receiver<bool>` (~16 bytes; a refcount bump on the tunnel's shared watch state, **no**
+  per-connection heap allocation), and the shared state is one small allocation per tunnel (few).
+  Keeping the receiver off `H2Stream` means inbound server streams pay nothing for it. At any scale
+  this is dwarfed (<0.1%) by each connection's h2 flow-control/window buffers (KB–MB). We chose the
+  racing receiver over a post-hoc `Arc<AtomicBool>` check (which would shave the receiver but
+  reintroduce the attribution race) — the determinism is worth the ~16 bytes.
 
 ---
 
 ## Current status
 
-**Done (inbound, Strategy A):**
+**Done (inbound + outbound, Strategy A):**
 
 - Shared foundation: CRL change notification + per-connection revocation signal.
-- Inbound existing-connection enforcement: on a CRL update, an open connection whose peer cert is
-  revoked is abruptly terminated.
-- Observability: an `info` log attributing the termination (with peer identity), a CRL rejection
-  metric, and per-stream access-log attribution (`CERT_REVOKED`) via the RBAC-precedent path.
-- One namespaced integration test: establish a connection, do a successful request, revoke the
-  client cert mid-connection via a CRL file update, assert the connection is torn down and the
-  metric increments.
+- Inbound existing-connection enforcement: on a CRL update, an open connection whose peer (client)
+  cert is revoked is abruptly terminated (h2 GOAWAY).
+- Outbound existing-connection enforcement: each pooled HBONE tunnel's connection driver
+  (`drive_connection`) captures the upstream server chain's `(issuer, serial)` at handshake,
+  subscribes to CRL updates, and abruptly tears the tunnel down (drops the client `Connection`,
+  resetting in-flight streams) if the server cert is revoked. Covers both the pooled single-HBONE
+  path and the double-HBONE inner tunnel, since both route through `h2::client::spawn_connection`.
+  Same per-connection self-check pattern as inbound (no central cert cache).
+- Observability: a log attributing the termination (with peer identity), a directional CRL
+  rejection metric (`reporter=destination` inbound, `reporter=source` outbound), and per-connection
+  access-log attribution (`CERT_REVOKED`) in **both** directions via the shared
+  `extract_failure_reason` path. The attribution mechanism is unified: each direction **races its
+  data future against the shared `await_revocation(rx)` helper**, and the revocation arm resolves to
+  `Error::CertificateRevoked`. The race is `biased` with the revocation arm first, which makes
+  attribution deterministic — the driver sets the revocation signal *before* tearing the connection
+  down (the thing that makes the data future fail with a generic reset), so the revocation arm
+  always wins when a teardown is due to revocation. Inbound races inside `handle_connection!` (which
+  also races the RBAC drain); outbound races in an inline `select!` at the record site. The
+  revocation `watch::Receiver` lives on the tunnel handle (`H2ConnectClient`), surfaced from the
+  pool checkout — not on the byte-stream `H2Stream`. Double-HBONE races **both** the outer (E/W
+  gateway) and inner (final destination) tunnel signals, so a revocation at either hop is surfaced.
+- Two namespaced integration tests (one per direction): establish a connection, do a successful
+  request, revoke the relevant cert mid-connection via a CRL file update, assert the connection is
+  torn down and the metric increments.
 
 **Not yet done:**
 
-- **Outbound** existing-connection enforcement (outbound tunnels live in the HBONE pool, which has
-  no per-tunnel teardown today — this is net-new and larger than inbound).
 - **Strategy B** wiring, so A vs B can be benchmarked.
 - **The benchmarks themselves** (synthetic connection load; memory + CPU; scan-all vs IA-bucketed
   vs cuckoo).
@@ -130,10 +159,12 @@ enough at our scale.
 
 ## Roadmap
 
-1. Inbound, Strategy A — **(current)**.
-2. Wire Strategy B and run the A-vs-B benchmark; benchmark the find-which-connections data
+1. Inbound, Strategy A — **done**.
+2. Outbound existing-connection teardown + attribution, Strategy A — **done**. Both directions now
+   share a consistent pattern: capture minimal `(issuer, serial)` at handshake → subscribe to CRL →
+   self-check in the per-connection driver's `select!` loop → abrupt close on revocation →
+   directional `crl_rejection` metric → `CERT_REVOKED` access-log attribution.
+3. Wire Strategy B and run the A-vs-B benchmark; benchmark the find-which-connections data
    structures (scan-all vs IA-bucketed vs cuckoo) under synthetic load.
-3. Implement outbound existing-connection teardown and reconcile the inbound (connection-manager-
-   adjacent) and outbound (HBONE pool) paths into a consistent pattern.
 4. Extend the harness for intermediate-CA chains and add the IA/root revocation scenarios.
 5. Commit to the benchmarked winner; remove the also-rans.
