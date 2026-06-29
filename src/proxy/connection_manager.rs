@@ -119,14 +119,19 @@ macro_rules! handle_connection {
     // either via `extract_failure_reason` with no call-site conditionals.
     ($connguard:expr, $crl_revoked:expr, $future:expr) => {{
         let watch = $connguard.watcher();
+        // `biased` with the termination arms first makes attribution deterministic.
+        // Both signals are set *before* the connection is torn down,
+        // so polling them ahead of `$future` guarantees a revocation/late-rejection
+        // wins the race rather than the generic teardown error.
         tokio::select! {
+            biased;
+            _ = $crate::proxy::connection_manager::await_revocation($crl_revoked) => {
+                Err(Error::CertificateRevoked)
+            }
+            _signaled = watch.wait_for_drain() => Err(Error::AuthorizationPolicyLateRejection),
             res = $future => {
                 $connguard.release();
                 res
-            }
-            _signaled = watch.wait_for_drain() => Err(Error::AuthorizationPolicyLateRejection),
-            _ = $crate::proxy::connection_manager::await_revocation($crl_revoked) => {
-                Err(Error::CertificateRevoked)
             }
         }
     }};

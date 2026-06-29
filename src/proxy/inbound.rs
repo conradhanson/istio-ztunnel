@@ -149,20 +149,19 @@ impl Inbound {
                     };
                     debug!(%conn, "accepted connection");
                     let cfg = pi.cfg.clone();
-                    // Per-connection CRL revocation signal: set by serve_connection when this peer's
-                    // cert is revoked, watched by each stream's serving future so the access log
-                    // attributes the termination (mirrors the RBAC late-rejection drain).
-                    let (revoked_tx, revoked_rx) = watch::channel(false);
                     // Enforce CRL revocation on this existing connection when a CRL is configured.
+                    // The revocation state owns the per-connection signal that `serve_connection`
+                    // sets when this peer's cert is revoked; each stream's serving future watches a
+                    // receiver of it so the access log attributes the termination (mirrors the RBAC
+                    // late-rejection drain).
                     let revocation = pi.crl_manager.as_ref().map(|crl_manager| {
-                        h2::server::ConnectionRevocation::new(
-                            &tls,
+                        h2::revocation::ConnectionRevocation::new(
+                            ssl,
                             crl_manager.clone(),
                             pi.metrics.clone(),
-                            conn.src_identity.clone(),
-                            revoked_tx,
                         )
                     });
+                    let revoked_rx = revocation.as_ref().map(|r| r.subscribe_revoked());
                     let request_handler = move |req| {
                         let id = Self::extract_traceparent(&req);
                         let peer = conn.src;
@@ -222,7 +221,7 @@ impl Inbound {
         pi: Arc<ProxyInputs>,
         conn: Connection,
         enable_original_source: bool,
-        revoked: watch::Receiver<bool>,
+        revoked: Option<watch::Receiver<bool>>,
         req: H2Request,
     ) {
         let src = conn.src;
@@ -361,7 +360,7 @@ impl Inbound {
                 .instrument(trace_span!("hbone server"))
                 .await
             });
-        let res = handle_connection!(conn_guard, Some(revoked), send);
+        let res = handle_connection!(conn_guard, revoked, send);
         ri.result_tracker.record(res);
     }
 
