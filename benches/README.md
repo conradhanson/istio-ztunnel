@@ -14,6 +14,91 @@ $ # ...change something...
 $ cargo bench -- --baseline <name> # compare against it
 ```
 
+### CRL revocation re-evaluation (`crl`)
+
+[`crl.rs`](./crl.rs) benchmarks the CPU of re-evaluating existing connections when a CRL is
+(re)loaded — building the revoked set, scanning N tracked connections (swept over connection count
+N and issuer count M, for both leaf- and IA-cert revocation), and a single membership check. The
+sweep groups report **time per element** (`Throughput::Elements`), so a flat per-element time across
+the sweep means linear scaling and a rising one flags super-linear (O(n²)) behavior.
+
+```shell
+$ cargo bench --bench crl                      # full run
+$ cargo bench --bench crl -- --quick           # fast pass
+$ cargo bench --bench crl -- --save-baseline scan-all   # freeze the current impl as the baseline
+$ # ...implement an alternative strategy...
+$ cargo bench --bench crl -- --baseline scan-all        # compare a candidate against it
+```
+
+The `RevocationStrategy` trait in `crl.rs` is the comparison seam: alternative designs (IA-bucketed,
+cuckoo, full webpki re-validation) implement it and run the identical sweeps.
+
+### CRL revocation data-plane impact (`crl_reload`)
+
+[`crl_reload.rs`](./crl_reload.rs) is a custom async harness (not criterion — it measures
+distributions and a throughput time-series, not a repeated scalar) for the *systemic* behavior when
+a CRL reload fires: the thundering-herd wakeup of every watcher, the latency until revoked
+connections close, and whether that storm starves active traffic. It runs mechanism-level (in-memory
+duplex pipes, no TLS/h2/sudo): `H` busy "healthy" connections generate measured throughput while `V`
+idle "victim" connections park in the (inlined) `wait_for_revocation` loop and all close on reload.
+
+```shell
+$ cargo bench --bench crl_reload   # prints a report table; no arguments
+```
+
+Each row reports, per scenario × V: close latency `p50/p99/max` across the victims, and healthy
+throughput before/during/after the reload with the `dip%`. It fires `load_crl()` directly (skipping
+the 2s file-watch debounce). Numbers are single-run and indicative — expect a few % run-to-run
+variance on the dip.
+
+### CRL reload data-plane impact, real stack (`crl_reload_real`)
+
+[`crl_reload_real.rs`](./crl_reload_real.rs) validates `crl_reload`'s findings against the **real
+encrypted HBONE data plane** in network namespaces (like `throughput.rs` and the namespaced CRL
+tests) — because the mechanism-level harness's synthetic single-event dip is too noisy to trust
+(it once reported an impossible *negative* dip). **Requires root**, like the other namespaced tests.
+
+Symmetric paired topology: each *entity* is a client workload ↔ server workload pair; the client
+opens `CRL_STREAMS` connections to its server (→ one HBONE tunnel per entity). `HEALTHY_TUNNELS`
+entities are never revoked and drive continuous real round-trips (measured throughput); over
+`RELOAD_CYCLES` **isolated** reload events (recovery between them — not continuous churn), each event
+revokes a fresh `VICTIMS_PER_CYCLE` batch of entities. It reports reload→close latency
+(`p50/p99/max` + debounce-independent teardown spread), the observed **blast radius** (connections
+closed per revoked identity), and the healthy-throughput dip **averaged over the events (mean ± std)**.
+
+Two axes, selected per run via env vars, cover both enforcement code paths and pooling:
+- `CRL_DIRECTION=inbound` (default) — server ztunnel holds the CRL, revokes client certs, tears down
+  via server GOAWAY. `outbound` — client ztunnel holds the CRL, revokes server certs, drops the
+  pooled client tunnel.
+- `CRL_STREAMS=N` (default 1) — connections multiplexed per tunnel. `>1` exercises per-tunnel
+  enforcement amortized over many streams, the teardown blast radius, and `CERT_REVOKED` attribution
+  across streams (ztunnel pools same-`(src_id,dst_id,dst,src)` connections over one tunnel, up to
+  `pool_max_streams_per_conn`=100, with one `ConnectionRevocation` per tunnel).
+
+Every line this bench prints is tagged `[crl-bench]`, so results are greppable even when captured
+interleaved with ztunnel's telemetry. The bench raises its own `RLIMIT_NOFILE` at startup (a shell
+`ulimit -n` does **not** survive `sudo`), and prints the effective limit — no manual `ulimit` needed.
+
+Scale knobs are runtime env vars (no recompile): `CRL_DIRECTION` (`inbound`/`outbound`),
+`CRL_STREAMS` (streams/tunnel, near 100 = the real ceiling), `CRL_HEALTHY` (measured tunnels), and
+`CRL_CYCLES` (reload events = dip samples). Entity count (`CRL_HEALTHY` + `CRL_CYCLES`) is the
+expensive axis — raise it as far as the machine sustains for statistical relevance.
+
+```shell
+# Sweep the matrix near ztunnel's real multiplex ceiling (1 vs ~90 streams/tunnel), with a large
+# healthy baseline and many reload events. Tune CRL_HEALTHY/CRL_CYCLES down if resources bite.
+$ for dir in inbound outbound; do for s in 1 90; do \
+    sudo -E CRL_DIRECTION=$dir CRL_STREAMS=$s CRL_HEALTHY=32 CRL_CYCLES=15 env "PATH=$PATH" \
+      cargo bench --bench crl_reload_real 2>&1 | grep '\[crl-bench\]'; done; done
+```
+
+If the printed `RLIMIT_NOFILE` limit is still low (the hard-limit raise can be blocked by
+`/proc/sys/fs/nr_open`), raise that ceiling once: `sudo sysctl -w fs.nr_open=1048576`.
+
+Leaf/workload-cert revocation only (no intermediate CAs in the harness yet), and real-netns scale is
+far below `crl_reload`'s sweep — so this is **definitive at realistic connection counts** and
+complements, rather than replaces, the mechanism-level large-N exploration.
+
 ## Performance
 
 Ztunnel performance largely falls into throughput and latency.

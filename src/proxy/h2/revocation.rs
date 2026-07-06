@@ -26,14 +26,9 @@ use crate::tls::crl::CrlManager;
 /// Per-connection CRL revocation enforcement for an HBONE connection, shared by both directions:
 ///
 /// - inbound server ([`super::server::serve_connection`]) checks the peer (client) chain
-/// - outbound client connection driver ([`super::client::drive_connection`]) checks the upstream
-/// server chain.
-/// - In both cases, the connection's serving task watches for CRL updates and, on
-/// revocation, tears the connection down abruptly (a security event) while attributing the
-/// termination as `CERT_REVOKED` in the access log.
-///
-/// Boxed by callers and held off to the side so it adds only a pointer to the (size-sensitive)
-/// per-connection driver future — it is cold state, touched only on a CRL update.
+/// - outbound client connection driver ([`super::client::drive_connection`]) checks the upstream server chain
+/// - in both cases, on revocation the connection's serving task tears the connection down abruptly
+///   (a security event), attributing the termination as `CERT_REVOKED` in the access log
 pub struct ConnectionRevocation {
     crl_manager: Arc<CrlManager>,
     metrics: Arc<Metrics>,

@@ -116,6 +116,41 @@ enough at our scale.
 
 ---
 
+## Memory footprint (per-tunnel, Strategy A)
+
+Each open HBONE tunnel — inbound or outbound — carries exactly one `ConnectionRevocation`
+(a `Box<Self>`), so the memory this workstream adds is **O(open tunnels)**, not O(streams): one
+tunnel multiplexes up to `pool_max_streams_per_conn`=100 streams behind a *single* revocation
+object. Per-tunnel breakdown (x86-64):
+
+| Component | Cost | Notes |
+|---|---|---|
+| `Box<ConnectionRevocation>` inline | ~88 B (→ ~96 B allocated) | two `Arc` ptrs to shared globals (`CrlManager`, `Metrics`), `Vec` header, `watch::Receiver<u64>` (16 B), `Option<Identity>` (3×`ArcStr` = 24 B), `watch::Sender<bool>` (8 B) |
+| `ids: Vec<CertId>` contents | ~135 B (leaf-only) → ~270 B (leaf+IA) | **dominant cost**; each `CertId` = two `Vec<u8>` (48 B) + issuer DER (~50–80 B) + raw serial (~16–20 B) |
+| per-tunnel `revoked_tx` watch channel | ~120–150 B | fresh `Shared<bool>` (RwLock + atomics + `Notify`) allocated by `watch::channel(false)` |
+| `peer_identity` strings | ~0 marginal | the three `ArcStr` are refcount bumps of live workload identities, not new allocations |
+
+**Total ≈ 0.4 KB/tunnel (leaf-only) to ~0.5–0.6 KB/tunnel (leaf+intermediate)** → ~5 MB @ 10k
+tunnels, ~25 MB @ 50k tunnels.
+
+What does **not** scale per-tunnel: `crl_manager`/`metrics` are shared `Arc`s (pointer copies), and
+`crl_rx` subscribes to the **single** global `CrlManager` watch channel — a refcount bump plus the
+16 inline bytes, no per-tunnel allocation.
+
+Two framing points:
+
+- **It's net-new but not dominant.** There was no per-tunnel revocation object before this
+  workstream, and the cost is genuinely linear in open tunnels — but each tunnel's rustls session
+  (send buffer up to `max_send_buffer_size`=256 KB, deframer/receive buffers, key material) plus h2
+  state is tens of KB, so `ConnectionRevocation` is well under ~2% of per-tunnel state.
+- **Per-tunnel (not per-stream) is the efficient choice.** At full multiplexing the amortized cost
+  is ~5 bytes/stream; the rejected H2Stream-level design would have been up to ~100× this.
+
+Of the fields, only `ids` is enforcement-critical heap; `peer_identity` exists purely for log
+attribution and the `revoked_tx`/`crl_rx` plumbing purely for the revocation signal.
+
+---
+
 ## Current status
 
 **Done (inbound + outbound, Strategy A):**
@@ -145,12 +180,128 @@ enough at our scale.
 - Two namespaced integration tests (one per direction): establish a connection, do a successful
   request, revoke the relevant cert mid-connection via a CRL file update, assert the connection is
   torn down and the metric increments.
+- **Phase-1 benchmarks** (`benches/crl.rs`, criterion): the CPU of revocation re-evaluation —
+  `crl_build` (parse + build revoked set, swept over R and M), `crl_evaluate` (re-evaluate N
+  tracked connections, swept over N × M, for `leaf` and `ia` revocation), and `crl_check` (single
+  `any_revoked`). Sweeps use `Throughput::Elements` so per-element time exposes any super-linear
+  behavior; a `RevocationStrategy` trait (baseline = `ScanAll`) is the comparison seam for future
+  candidates via `--save-baseline`/`--baseline`. Baseline results confirm **linear** scaling
+  (~flat per-connection time across N=1k→100k), the expected leaf-vs-IA (L=1 vs L=2) cost gap, and
+  that `any_revoked` is O(chain length), independent of revoked-set size.
+
+- **Phase-2 benchmark** (`benches/crl_reload.rs`, custom async harness): the data-plane impact of a
+  reload. `H` busy "healthy" connections generate measured throughput while `V` idle "victim"
+  connections park in the (inlined) `wait_for_revocation` loop and all close on reload. Reports
+  reload→close latency (p50/p99/max) and healthy-throughput dip, swept over V for `leaf`/`ia`.
+  Mechanism-level (in-memory pipes, no TLS/h2/sudo). Baseline findings:
+  - **Close-latency tail is linear in V** (no O(n²)): ~p99 48 ms @ 10k, ~226 ms @ 50k victims.
+  - **Throughput dip is small (~5–7%) even at 50k victims and fully recovers** afterward — the
+    decentralized thundering-herd wakeup is tolerable at these scales.
+  - **`leaf` revocation closed slower than `ia`** (e.g. p50 121 ms vs 91 ms @ 50k) because `leaf`
+    ships a large CRL (V entries), and `reload_crl_data` used to hold the `inner` **write lock across
+    the whole parse+build**, so victims that woke and called `any_revoked` blocked on the read lock
+    for the build duration.
+
+- **Phase-2 real-stack validation** (`benches/crl_reload_real.rs`, netns, **root required**): the
+  same data-plane questions on the **real encrypted HBONE stack** (built on `throughput.rs`'s
+  harness + the namespaced CRL mechanics), because the mechanism-level harness's synthetic
+  single-event dip proved too noisy to trust (it reported an impossible negative dip). Healthy
+  HBONE connections carry continuous real traffic while **repeated isolated reload events** (with
+  recovery between — deliberately *not* continuous churn, which measures an unrealistic workload)
+  each revoke a fresh batch of victim workloads. Reports reload→close latency (p50/p99/max + a
+  debounce-independent teardown spread) and the healthy-throughput dip **averaged over the events
+  (mean ± std)**. Leaf/workload-cert revocation only (harness has no intermediate CAs yet), and
+  real-netns scale is far below the mechanism-level sweep — so it's definitive at realistic
+  connection counts and complements, rather than replaces, `crl_reload.rs`. **Now parameterized over
+  both enforcement code paths and pooling** (`CRL_DIRECTION=inbound|outbound`, `CRL_STREAMS=N`),
+  using a symmetric paired topology (each entity = client↔server workload pair; the client opens
+  `CRL_STREAMS` connections → one tunnel per entity) so the directions are directly comparable. This
+  covers what earlier runs missed: the outbound path (client drops the pooled tunnel vs server
+  GOAWAY) and **multiplexing** — one `ConnectionRevocation` per *tunnel* shared by up to 100 streams,
+  so `CRL_STREAMS>1` exercises per-tunnel amortization, the teardown **blast radius** (one revocation
+  closes all the tunnel's streams), and `CERT_REVOKED` attribution across those streams.
+
+  **Initial results — inbound, single-stream** (8 healthy, 8 events × 5 victims):
+  - **Throughput dip is statistically zero** — mean 2.5% ± 6.0% over 8 events, with 3/8 events
+    showing *negative* (impossible) dips → the swings are noise; healthy HBONE throughput is
+    unaffected by reloads at realistic scale. (The mechanism-level harness couldn't tell us this from
+    a single sample; 8 isolated events make the ±6% noise band explicit.)
+  - **Close latency is tight and debounce-dominated:** p50/p99/max all 2.29–2.30s (n=40). The ~2s is
+    the file-watcher debounce; reload-apply + detect + GOAWAY + client-observes adds only ~290ms and
+    is uniform. **The 2s watch debounce is the dominant, tunable latency knob.**
+  - **Herd drain trivial at scale:** all 5 victims per batch close within 0.29 ms of each other.
+  - Real-stack access logs confirmed the `CERT_REVOKED` inbound attribution end-to-end.
+
+  **Matrix results** (`{inbound, outbound} × {1, 15} streams`, 12 healthy tunnels, 5 events × 1
+  victim; the bench self-raises `RLIMIT_NOFILE`):
+
+  | direction | streams | blast radius | close p50/p99/max | teardown spread | dip mean ± std |
+  |---|---|---|---|---|---|
+  | inbound | 1 | 5/5 | 2.29 / 2.50 / 2.50 s | 0.00 ms | −0.4% ± 2.5% |
+  | outbound | 1 | 5/5 | 2.30 / 2.30 / 2.30 s | 0.00 ms | −1.0% ± 0.6% |
+  | inbound | 15 | 75/75 | 2.30 / 2.30 / 2.30 s | 0.25 ms | 6.2% ± 2.1% |
+  | outbound | 15 | 75/75 | 2.29 / 2.35 / 2.35 s | 1.58 ms | 7.1% ± 1.7% |
+
+  - **Blast radius = streams-per-tunnel, exactly** (5/5, 75/75): one `ConnectionRevocation` per
+    *tunnel* handles all multiplexed streams; enforcement amortizes, teardown concentrates.
+  - **Close latency ~2.3s, debounce-dominated, direction-independent** → outbound (tunnel-drop)
+    enforces as promptly as inbound (GOAWAY); multiplexing doesn't slow detection.
+  - **Teardown drain tiny** (≤1.6 ms even for 15 simultaneous streams); outbound a hair slower than
+    inbound but immaterial.
+  - **Throughput dip scales with the multiplexing factor:** at 1 stream/tunnel it's **zero**
+    (−1%…−0.4%, within noise); at 15 streams/tunnel it's a **small but statistically real ~6–7%
+    transient** (mean 3–4× its std; every cycle shows `before ≈ after > during` — a clean
+    dip-and-recover over a ~50 ms window). It's driven by the *absolute burst of simultaneous stream
+    resets* (blast radius), not the fraction of streams closed, and recovers immediately.
+    Direction-independent (6.2% inbound ≈ 7.1% outbound).
+  - **Measured at the near-ceiling** (`CRL_STREAMS=90`, 32 healthy tunnels, 15 events; ztunnel's
+    per-tunnel multiplex limit is 100): tearing down a maxed-out 90-stream tunnel closes all **90**
+    streams (1350/1350) and causes a **~15% healthy-throughput dip** (inbound 15.0% ± 9.5%, outbound
+    16.2% ± 9.5%) over the ~50 ms window, with full recovery (`before ≈ after` every cycle). Close
+    latency stays ~2.3 s (debounce-bound); teardown drain grows with blast radius but stays small
+    (~6.5 ms inbound, ~14 ms outbound). Single-stream is within noise (−0.2% / 5.2%).
+    **So the dip scales with blast radius: ~0% (1 stream) → ~6–7% (15) → ~15% (90).** Even the worst
+    case — revoking a ceiling-multiplexed tunnel — is a brief, self-recovering blip during a rare
+    event; the design holds at production multiplex scale. (The wide ±9.5% std reflects netns timing
+    noise: the effect's existence and blast-radius scaling are firm, its precise magnitude less so.)
+    Scale knobs are env-driven (`CRL_HEALTHY`, `CRL_CYCLES`, `CRL_STREAMS`, `CRL_DIRECTION`).
+
+  **Fuller stream sweep** (`{inbound, outbound} × {30, 60, 90}` streams, 32 healthy tunnels, 15
+  events × 1 victim) — samples the gap between the 15- and 90-stream points densely enough to show
+  the dip scales **monotonically** with blast radius rather than in steps:
+
+  | direction | streams | blast radius | close p50/p99/max | teardown spread | dip mean ± std |
+  |---|---|---|---|---|---|
+  | inbound | 30 | 420/450\* | 2.29 / 2.31 / 2.31 s | 0.30 ms | 6.6% ± 4.8% |
+  | inbound | 60 | 900/900 | 2.30 / 2.37 / 2.37 s | 2.85 ms | 10.3% ± 6.9% |
+  | inbound | 90 | 1350/1350 | 2.29 / 2.35 / 2.35 s | 6.55 ms | 15.0% ± 9.5% |
+  | outbound | 30 | 450/450 | 2.29 / 2.30 / 2.30 s | 3.15 ms | 4.6% ± 3.5% |
+  | outbound | 60 | 900/900 | 2.29 / 2.35 / 2.35 s | 9.35 ms | 12.8% ± 6.0% |
+  | outbound | 90 | 1350/1350 | 2.29 / 2.30 / 2.31 s | 13.98 ms | 16.2% ± 9.5% |
+
+  \* One inbound-30 cycle saw no closes (reload not applied — a file-watch/debounce miss), so
+  420/450 and dip averaged over 14 cycles; the other five rows closed 100% of expected connections.
+
+  - **Dip grows monotonically with streams/tunnel (blast radius):** ~5–7% @ 30 → ~10–13% @ 60 →
+    ~15–16% @ 90, roughly linear in the per-tunnel stream count and consistent across both
+    directions. Same effect the 1/15/90 matrix showed, now sampled densely enough to read as a
+    smooth curve. The 90-stream row reproduces the near-ceiling numbers above (15.0% / 16.2%) exactly.
+  - **Teardown spread also grows with blast radius but stays small** (≤14 ms even at 90 simultaneous
+    stream resets); outbound (tunnel-drop) drains consistently a few ms slower than inbound (GOAWAY),
+    immaterial next to the ~2.3 s debounce.
+  - **Close latency stays ~2.3 s, debounce-dominated and direction-independent** across the sweep.
+  - Recovery is immediate every cycle (`before ≈ after > during`) — a brief, self-recovering blip
+    during a rare event even when revoking a near-ceiling-multiplexed tunnel.
 
 **Not yet done:**
 
 - **Strategy B** wiring, so A vs B can be benchmarked.
-- **The benchmarks themselves** (synthetic connection load; memory + CPU; scan-all vs IA-bucketed
-  vs cuckoo).
+- **Analytical memory/space estimate** for Strategy B (Strategy A is done — see
+  [Memory footprint](#memory-footprint-per-tunnel-strategy-a) above; ~0.4–0.6 KB/tunnel).
+- **Other candidate structures** under the Phase-1 benches (IA-bucketed, cuckoo, full webpki
+  re-validation) once built.
+- **Phase-2 extensions**: intermediate-CA (IA) revocation validation once the harness issues
+  root→IA→leaf chains; higher real-stack connection counts if feasible.
 - **Intermediate-CA test scenarios** (workload-cert revoked by its signing IA; IA revoked by the
   root). These require extending the test harness to issue root→IA→leaf chains, which it does not
   do today.

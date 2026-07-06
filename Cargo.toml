@@ -31,6 +31,18 @@ harness = false
 name = "basic"
 harness = false
 
+[[bench]]
+name = "crl"
+harness = false
+
+[[bench]]
+name = "crl_reload"
+harness = false
+
+[[bench]]
+name = "crl_reload_real"
+harness = false
+
 [dependencies]
 # Enabled with 'tls-boring'
 boring-rustls-provider = { git = "https://github.com/janrueth/boring-rustls-provider", optional = true } #
