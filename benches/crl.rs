@@ -12,236 +12,209 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Phase-1 benchmarks for CRL enforcement on existing connections.
+//! Benchmarks for CRL enforcement on existing connections.
 //!
-//! These measure the **CPU of revocation re-evaluation** — the work done when a CRL is (re)loaded.
-//! There are three benchmark groups:
+//! Existing-connection revocation re-runs the same shared webpki chain-validation path used at
+//! handshake time (`verify_cert_chain`) against each connection's cached peer chain whenever the
+//! CRL reloads — see `ConnectionRevocation::is_revoked` in `src/proxy/h2/revocation.rs`. Unlike a
+//! plain `(issuer, serial)` membership lookup, this cost is dominated by webpki path-building and
+//! signature verification, so these benchmarks use real, chain-buildable certificates throughout
+//! rather than synthetic issuer/serial bytes.
 //!
-//! - `crl_build` — parse a CRL and build the revoked `(issuer, serial)` set, swept over revoked-entry count R and issuer count M.
-//! - `crl_evaluate` — re-evaluate N tracked connections against a freshly loaded CRL (baseline = scan-all: one `any_revoked` per connection), swept over N and M, for a `leaf` revocation (one cert, ~1 hit) and an `ia` revocation (one issuer, ~N/M hits, L=2 chains).
-//! - `crl_check` — a single `any_revoked` call, to confirm it is O(chain length) and independent of the revoked-set size R.
+//! - `crl_build` — parse a CRL file and build the pre-parsed webpki `CertRevocationList`s, swept
+//!   over revoked-entry count R and issuer count M. This is now the *entire* reload cost (there is
+//!   no separate membership-set build anymore).
+//! - `crl_evaluate` — re-verify N tracked connections' cached chains against a freshly loaded CRL,
+//!   swept over N, for a `leaf` revocation (chain length 1) and an `ia` revocation (chain length 2:
+//!   leaf + issuing CA, M issuing CAs, one revoked).
+//! - `crl_check` — a single re-verification call for `leaf` and `ia` chain shapes, to see the fixed
+//!   per-call cost independent of N.
 //!
-//! O(n²) detection: the sweep groups use `Throughput::Elements`, so criterion reports **time per
-//! element**. A flat per-element time across N (or R) ⇒ linear; a rising one ⇒ super-linear.
-//! Compare candidate implementations with `--save-baseline` / `--baseline` (see benches/README.md).
-//!
-//! The `RevocationStrategy` trait is the comparison seam: the current production design is
-//! `ScanAll`; future candidates (IA-bucketed, cuckoo, full webpki re-validation) implement the same
-//! trait and run the identical sweeps.
+//! O(n²) detection: sweep groups use `Throughput::Elements`, so criterion reports time per element;
+//! flat ⇒ linear, rising ⇒ super-linear. Compare candidate implementations with `--save-baseline` /
+//! `--baseline` (see benches/README.md).
 
 mod profiler;
 
 use std::io::Write;
-use std::time::Duration;
+use std::str::FromStr;
+use std::time::{Duration, SystemTime};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use profiler::{Output, PProfProfiler};
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateRevocationListParams, DistinguishedName,
-    DnType, IsCa, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
-    RevocationReason, RevokedCertParams, SerialNumber,
+    CertificateRevocationListParams, DistinguishedName, DnType, Issuer, KeyIdMethod, KeyPair,
+    PKCS_ECDSA_P256_SHA256, RevocationReason, RevokedCertParams, SerialNumber,
 };
+use rustls::pki_types::{CertificateDer, UnixTime};
+use rustls::{CertificateError, RootCertStore};
 use tempfile::NamedTempFile;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use ztunnel::tls::CertId;
+use webpki::KeyUsage;
+use ztunnel::identity::Identity;
+use ztunnel::tls::WorkloadCertificate;
 use ztunnel::tls::crl::CrlManager;
+use ztunnel::tls::mock::{
+    TEST_ROOT, TEST_ROOT_KEY, TestIdentity, crl_pem_revoking_cert, generate_intermediate_ca,
+    generate_test_certs_with_root, verify_cert_chain,
+};
 
-// ---------------------------------------------------------------------------
-// Comparison seam: every candidate revocation strategy implements this trait.
-// ---------------------------------------------------------------------------
-
-/// A strategy for finding which of the tracked connections must be closed on a CRL (re)load.
-trait RevocationStrategy {
-    /// Index the given connections (each is the captured `(issuer, serial)` chain of one connection).
-    fn build(conns: Vec<Vec<CertId>>) -> Self
-    where
-        Self: Sized;
-    /// On a CRL (re)load, return how many tracked connections are now revoked (and must be closed).
-    fn on_reload(&self, crl: &CrlManager) -> usize;
-}
-
-/// The current production baseline: no central index — each connection self-checks via
-/// `CrlManager::any_revoked`. Modeled here as the aggregate scan over all tracked connections.
-struct ScanAll {
-    conns: Vec<Vec<CertId>>,
-}
-
-impl RevocationStrategy for ScanAll {
-    fn build(conns: Vec<Vec<CertId>>) -> Self {
-        Self { conns }
-    }
-    fn on_reload(&self, crl: &CrlManager) -> usize {
-        self.conns
-            .iter()
-            .filter(|chain| crl.any_revoked(chain))
-            .count()
-    }
+/// Re-runs the exact check `ConnectionRevocation::is_revoked` uses: a full webpki chain
+/// verification, classifying only `CertificateError::Revoked` as "revoked".
+fn is_revoked(chain: &[CertificateDer<'static>], roots: &RootCertStore, crl: &CrlManager) -> bool {
+    let Some((end_entity, intermediates)) = chain.split_first() else {
+        return false;
+    };
+    matches!(
+        verify_cert_chain(
+            end_entity,
+            intermediates,
+            roots,
+            UnixTime::now(),
+            KeyUsage::server_auth(),
+            Some(crl),
+        ),
+        Err(rustls::Error::InvalidCertificate(CertificateError::Revoked))
+    )
 }
 
 // ---------------------------------------------------------------------------
 // CRL / workload generation.
-//
-// We generate CRLs with rcgen and derive the matching CertIds by parsing those CRLs with
-// x509-parser — i.e. the exact `(issuer.as_raw(), raw_serial())` bytes that CrlManager itself
-// stores in its revoked set. This guarantees hits match without generating a leaf cert per
-// connection, and keeps the encoding identical to the production path.
 // ---------------------------------------------------------------------------
 
-/// One issuer's parsed CRL material: its DER-encoded issuer Name, and the raw serials it revokes.
-struct IssuerCrl {
-    issuer: Vec<u8>,
-    revoked: Vec<Vec<u8>>,
+fn test_id() -> Identity {
+    Identity::from_str("spiffe://td/ns/n/sa/a").unwrap()
 }
 
-/// A serial that we never revoke, so a `(issuer, MISS_SERIAL)` lookup is a guaranteed miss.
-const MISS_SERIAL: [u8; 19] = [0xAA; 19];
-/// An issuer DER that is never a real CRL issuer key, so lookups for it miss at the first hop.
-const SYNTHETIC_ISSUER: [u8; 4] = [0x30, 0x00, 0x00, 0x00];
-
-fn make_ca(idx: usize) -> (KeyPair, CertificateParams) {
-    let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("ca key");
-    let mut params = CertificateParams::default();
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::OrganizationName, "cluster.local");
-    dn.push(DnType::CommonName, format!("ca-{idx}"));
-    params.distinguished_name = dn;
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    (kp, params)
+/// A workload cert (with its trust anchors) signed by `signing_key`, valid for an hour.
+fn workload_signed_by(signing_key: &[u8], extra_chain: &[&[u8]]) -> WorkloadCertificate {
+    let (key, cert) = generate_test_certs_with_root(
+        &TestIdentity::Identity(test_id()),
+        SystemTime::now(),
+        SystemTime::now() + Duration::from_secs(3600),
+        None,
+        signing_key,
+    );
+    let mut chain: Vec<&[u8]> = extra_chain.to_vec();
+    chain.push(TEST_ROOT);
+    WorkloadCertificate::new(key.as_bytes(), cert.as_bytes(), chain).unwrap()
 }
 
-/// Build a CRL for one issuer revoking `serials`, returning its PEM (for the on-disk CRL file the
-/// CrlManager loads) and its DER (for deriving the exact revoked-set bytes via x509-parser).
-fn build_crl(kp: &KeyPair, params: &CertificateParams, serials: &[Vec<u8>]) -> (String, Vec<u8>) {
-    let now = OffsetDateTime::now_utc();
-    let revoked_certs = serials
-        .iter()
-        .map(|s| RevokedCertParams {
-            serial_number: SerialNumber::from_slice(s),
-            revocation_time: now,
-            reason_code: Some(RevocationReason::KeyCompromise),
-            invalidity_date: None,
+/// The DER-encoded chain (leaf + intermediates, excluding the root) — the shape
+/// `ConnectionRevocation` captures from a peer's `CommonState::peer_certificates()`.
+fn chain_der(wl: &WorkloadCertificate) -> Vec<CertificateDer<'static>> {
+    wl.cert_and_intermediates()
+        .into_iter()
+        .map(|c| c.der)
+        .collect()
+}
+
+/// Writes `pem` to a fresh temp file and loads it into a `CrlManager`.
+fn crl_manager_for(pem: &str) -> (CrlManager, NamedTempFile) {
+    let mut file = NamedTempFile::new().expect("temp file");
+    file.write_all(pem.as_bytes()).expect("write CRL");
+    file.flush().expect("flush CRL");
+    let mgr = CrlManager::new(file.path().to_path_buf()).expect("load CRL");
+    (mgr, file)
+}
+
+/// `leaf` revocation: N chains of a single (root-signed) leaf cert, all identical except one,
+/// which is revoked. Chain length 1 — the cheapest real webpki verification shape.
+fn leaf_scenario(n: usize) -> (Vec<Vec<CertificateDer<'static>>>, RootCertStore, CrlManager, NamedTempFile) {
+    let revoked = workload_signed_by(TEST_ROOT_KEY, &[]);
+    let ok = workload_signed_by(TEST_ROOT_KEY, &[]);
+    let (crl, file) = crl_manager_for(&crl_pem_revoking_cert(&revoked.cert.serial_bytes()));
+    let roots = ok.root_store().as_ref().clone();
+    let chains = (0..n)
+        .map(|i| {
+            if i == 0 {
+                chain_der(&revoked)
+            } else {
+                chain_der(&ok)
+            }
         })
         .collect();
-    let crl_params = CertificateRevocationListParams {
-        this_update: now,
-        next_update: now + TimeDuration::days(30),
-        crl_number: SerialNumber::from(1u64),
-        issuing_distribution_point: None,
-        revoked_certs,
-        key_identifier_method: KeyIdMethod::Sha256,
-    };
-    let issuer = Issuer::from_params(params, kp);
-    let crl = crl_params.signed_by(&issuer).expect("sign CRL");
-    (crl.pem().expect("CRL PEM"), crl.der().to_vec())
+    (chains, roots, crl, file)
 }
 
-/// Parse a CRL's DER into the exact `(issuer, [serial])` bytes CrlManager stores for it.
-fn parse_crl(der: &[u8]) -> IssuerCrl {
-    let (_, crl) = x509_parser::parse_x509_crl(der).expect("parse CRL");
-    IssuerCrl {
-        issuer: crl.issuer().as_raw().to_vec(),
-        revoked: crl
-            .iter_revoked_certificates()
-            .map(|rc| rc.raw_serial().to_vec())
-            .collect(),
-    }
-}
-
-/// Generate a CRL file covering `m` issuers, each revoking `revoked_per_issuer` serials, load it
-/// into a `CrlManager`, and return the manager plus the parsed per-issuer material. The temp file
-/// is returned so the caller keeps it alive for the duration of the benchmark.
-fn gen_crl(m: usize, revoked_per_issuer: usize) -> (CrlManager, NamedTempFile, Vec<IssuerCrl>) {
-    let mut pem = String::new();
-    let mut issuers = Vec::with_capacity(m);
-    for idx in 0..m {
-        let (kp, params) = make_ca(idx);
-        let serials: Vec<Vec<u8>> = (0..revoked_per_issuer)
-            .map(|s| (((idx as u64) << 32) | (s as u64 + 1)).to_be_bytes().to_vec())
-            .collect();
-        let (crl_pem, crl_der) = build_crl(&kp, &params, &serials);
-        pem.push_str(&crl_pem);
-        issuers.push(parse_crl(&crl_der));
-    }
-    let mut file = NamedTempFile::new().expect("temp file");
-    file.write_all(pem.as_bytes()).expect("write CRL");
-    file.flush().expect("flush CRL");
-    let crl = CrlManager::new(file.path().to_path_buf()).expect("load CRL");
-    (crl, file, issuers)
-}
-
-/// Just the on-disk CRL file (for the build benchmark, which times `CrlManager::new`).
-fn gen_crl_file(m: usize, revoked_per_issuer: usize) -> NamedTempFile {
-    let mut pem = String::new();
-    for idx in 0..m {
-        let (kp, params) = make_ca(idx);
-        let serials: Vec<Vec<u8>> = (0..revoked_per_issuer)
-            .map(|s| (((idx as u64) << 32) | (s as u64 + 1)).to_be_bytes().to_vec())
-            .collect();
-        let (crl_pem, _) = build_crl(&kp, &params, &serials);
-        pem.push_str(&crl_pem);
-    }
-    let mut file = NamedTempFile::new().expect("temp file");
-    file.write_all(pem.as_bytes()).expect("write CRL");
-    file.flush().expect("flush CRL");
-    file
-}
-
-/// `leaf` revocation: N single-cert (L=1) chains spread across M issuers; exactly one is revoked.
-fn leaf_conns(n: usize, issuers: &[IssuerCrl]) -> Vec<Vec<CertId>> {
-    let m = issuers.len();
-    (0..n)
-        .map(|i| {
-            let iss = &issuers[i % m];
-            let serial = if i == 0 {
-                iss.revoked[0].clone() // the single revoked leaf
-            } else {
-                MISS_SERIAL.to_vec()
-            };
-            vec![CertId {
-                issuer: iss.issuer.clone(),
-                serial,
-            }]
-        })
-        .collect()
-}
-
-/// `ia` revocation: N two-cert (L=2: leaf + issuing-CA) chains across M issuers; one issuer is
-/// revoked, so the ~N/M connections under it are hit on the upstream (issuer) position.
-fn ia_conns(n: usize, issuers: &[IssuerCrl]) -> Vec<Vec<CertId>> {
-    let m = issuers.len();
-    (0..n)
-        .map(|i| {
-            let ia = i % m;
-            let iss = &issuers[ia];
-            // leaf position: always a miss (issuer not a CRL key) — models chain length L=2.
-            let leaf = CertId {
-                issuer: SYNTHETIC_ISSUER.to_vec(),
-                serial: MISS_SERIAL.to_vec(),
-            };
-            // CA position: hit only for the one revoked issuer (ia == 0).
-            let ca = CertId {
-                issuer: iss.issuer.clone(),
-                serial: if ia == 0 {
-                    iss.revoked[0].clone()
-                } else {
-                    MISS_SERIAL.to_vec()
-                },
-            };
-            vec![leaf, ca]
-        })
-        .collect()
+/// `ia` revocation: N chains of length 2 (leaf + issuing CA) spread across `m` issuing CAs; the
+/// first issuing CA is revoked, so the ~N/m connections under it are hit.
+fn ia_scenario(
+    n: usize,
+    m: usize,
+) -> (
+    Vec<Vec<CertificateDer<'static>>>,
+    RootCertStore,
+    CrlManager,
+    NamedTempFile,
+) {
+    let ias: Vec<(String, String, Vec<u8>)> = (0..m)
+        .map(|_| generate_intermediate_ca(TEST_ROOT_KEY))
+        .collect();
+    let leaves: Vec<WorkloadCertificate> = ias
+        .iter()
+        .map(|(ia_key, ia_cert, _)| workload_signed_by(ia_key.as_bytes(), &[ia_cert.as_bytes()]))
+        .collect();
+    let (crl, file) = crl_manager_for(&crl_pem_revoking_cert(&ias[0].2));
+    let roots = leaves[0].root_store().as_ref().clone();
+    let chains = (0..n)
+        .map(|i| chain_der(&leaves[i % m]))
+        .collect();
+    (chains, roots, crl, file)
 }
 
 // ---------------------------------------------------------------------------
 // Benchmarks.
 // ---------------------------------------------------------------------------
 
-/// Build cost: parse a CRL and construct the revoked set. Swept over R (revoked entries) at M=1,
-/// and over M (issuers) at a fixed per-issuer count. Time-per-element should stay flat (linear).
+/// Build cost: parse a CRL and construct the pre-parsed webpki `CertRevocationList`s. Swept over R
+/// (revoked entries) at M=1, and over M (issuers) at a fixed per-issuer count. Time-per-element
+/// should stay flat (linear).
 fn crl_build(c: &mut Criterion) {
     let mut g = c.benchmark_group("crl_build");
     g.measurement_time(Duration::from_secs(5));
+
+    fn gen_crl_file(m: usize, revoked_per_issuer: usize) -> NamedTempFile {
+        let mut pem = String::new();
+        for idx in 0..m {
+            let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("ca key");
+            let mut params = rcgen::CertificateParams::default();
+            let mut dn = DistinguishedName::new();
+            dn.push(DnType::OrganizationName, "cluster.local");
+            dn.push(DnType::CommonName, format!("ca-{idx}"));
+            params.distinguished_name = dn;
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::CrlSign,
+            ];
+            let now = OffsetDateTime::now_utc();
+            let revoked_certs = (0..revoked_per_issuer)
+                .map(|s| RevokedCertParams {
+                    serial_number: SerialNumber::from(
+                        ((idx as u64) << 32) | (s as u64 + 1),
+                    ),
+                    revocation_time: now,
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                })
+                .collect();
+            let crl_params = CertificateRevocationListParams {
+                this_update: now,
+                next_update: now + TimeDuration::days(30),
+                crl_number: SerialNumber::from(1u64),
+                issuing_distribution_point: None,
+                revoked_certs,
+                key_identifier_method: KeyIdMethod::Sha256,
+            };
+            let issuer = Issuer::from_params(&params, &kp);
+            pem.push_str(&crl_params.signed_by(&issuer).expect("sign CRL").pem().unwrap());
+        }
+        let mut file = NamedTempFile::new().expect("temp file");
+        file.write_all(pem.as_bytes()).expect("write CRL");
+        file.flush().expect("flush CRL");
+        file
+    }
 
     // Sweep R at a single issuer.
     for &r in &[1_000usize, 10_000, 100_000] {
@@ -263,74 +236,68 @@ fn crl_build(c: &mut Criterion) {
     g.finish();
 }
 
-/// Re-evaluation cost: scan N tracked connections against a freshly loaded CRL. Swept over N and M
-/// for both revocation scenarios. `Throughput::Elements(N)` ⇒ time-per-connection; flat = linear.
+/// Re-evaluation cost: re-verify N tracked connections' chains against a freshly loaded CRL. Swept
+/// over N for both scenarios. `Throughput::Elements(N)` ⇒ time-per-connection; flat = linear.
+/// N is smaller than the old membership-lookup sweep since a full chain verification (path
+/// building + signature checks) costs orders of magnitude more per call than a hashmap lookup.
 fn crl_evaluate(c: &mut Criterion) {
     let mut g = c.benchmark_group("crl_evaluate");
     g.measurement_time(Duration::from_secs(5));
+    g.sample_size(20);
 
-    type Builder = fn(usize, &[IssuerCrl]) -> Vec<Vec<CertId>>;
-    let scenarios: [(&str, Builder); 2] = [("leaf", leaf_conns), ("ia", ia_conns)];
+    for &n in &[100usize, 1_000, 5_000] {
+        let (chains, roots, crl, _file) = leaf_scenario(n);
+        g.throughput(Throughput::Elements(n as u64));
+        g.bench_with_input(BenchmarkId::new("leaf", n), &n, |b, _| {
+            b.iter(|| {
+                std::hint::black_box(
+                    chains
+                        .iter()
+                        .filter(|chain| is_revoked(chain, &roots, &crl))
+                        .count(),
+                )
+            })
+        });
+    }
 
-    for (scenario, build_conns) in scenarios {
-        for &m in &[1usize, 64] {
-            // A small revoked set per issuer — the scan cost is about N and chain length, not R.
-            let (crl, _file, issuers) = gen_crl(m, 4);
-            for &n in &[1_000usize, 10_000, 100_000] {
-                let strat = ScanAll::build(build_conns(n, &issuers));
-                g.throughput(Throughput::Elements(n as u64));
-                g.bench_with_input(
-                    BenchmarkId::new(format!("{scenario}_m{m}"), n),
-                    &n,
-                    |b, _| b.iter(|| std::hint::black_box(strat.on_reload(&crl))),
-                );
-            }
+    for &m in &[1usize, 8] {
+        for &n in &[100usize, 1_000, 5_000] {
+            let (chains, roots, crl, _file) = ia_scenario(n, m);
+            g.throughput(Throughput::Elements(n as u64));
+            g.bench_with_input(BenchmarkId::new(format!("ia_m{m}"), n), &n, |b, _| {
+                b.iter(|| {
+                    std::hint::black_box(
+                        chains
+                            .iter()
+                            .filter(|chain| is_revoked(chain, &roots, &crl))
+                            .count(),
+                    )
+                })
+            });
         }
     }
     g.finish();
 }
 
-/// Single-check cost: confirm `any_revoked` is O(chain length) and independent of revoked-set size.
+/// Single-check cost: the fixed per-call cost of re-verifying one connection's chain, for `leaf`
+/// (chain length 1) and `ia` (chain length 2) shapes, both for a hit (revoked) and a miss.
 fn crl_check(c: &mut Criterion) {
     let mut g = c.benchmark_group("crl_check");
     g.measurement_time(Duration::from_secs(3));
 
-    // A non-trivial revoked set, to show the single-check cost does not grow with it.
-    let (crl, _file, issuers) = gen_crl(1, 10_000);
-    let iss = &issuers[0];
+    let (leaf_chains, leaf_roots, leaf_crl, _leaf_file) = leaf_scenario(2);
+    let (ia_chains, ia_roots, ia_crl, _ia_file) = ia_scenario(2, 1);
 
-    let hit_l1 = vec![CertId {
-        issuer: iss.issuer.clone(),
-        serial: iss.revoked[0].clone(),
-    }];
-    let miss_l1 = vec![CertId {
-        issuer: iss.issuer.clone(),
-        serial: MISS_SERIAL.to_vec(),
-    }];
-    let miss_l3 = vec![
-        CertId {
-            issuer: SYNTHETIC_ISSUER.to_vec(),
-            serial: MISS_SERIAL.to_vec(),
-        },
-        CertId {
-            issuer: SYNTHETIC_ISSUER.to_vec(),
-            serial: MISS_SERIAL.to_vec(),
-        },
-        CertId {
-            issuer: iss.issuer.clone(),
-            serial: MISS_SERIAL.to_vec(),
-        },
-    ];
+    g.bench_function("leaf_hit", |b| {
+        b.iter(|| std::hint::black_box(is_revoked(&leaf_chains[0], &leaf_roots, &leaf_crl)))
+    });
+    g.bench_function("leaf_miss", |b| {
+        b.iter(|| std::hint::black_box(is_revoked(&leaf_chains[1], &leaf_roots, &leaf_crl)))
+    });
+    g.bench_function("ia_hit", |b| {
+        b.iter(|| std::hint::black_box(is_revoked(&ia_chains[0], &ia_roots, &ia_crl)))
+    });
 
-    g.bench_function("hit_l1", |b| {
-        b.iter(|| std::hint::black_box(crl.any_revoked(&hit_l1)))
-    });
-    g.bench_function("miss_l1", |b| {
-        b.iter(|| std::hint::black_box(crl.any_revoked(&miss_l1)))
-    });
-    g.bench_function("miss_l3", |b| {
-        b.iter(|| std::hint::black_box(crl.any_revoked(&miss_l3)))
-    });
     g.finish();
 }
 

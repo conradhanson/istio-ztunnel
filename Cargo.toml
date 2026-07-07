@@ -36,10 +36,6 @@ name = "crl"
 harness = false
 
 [[bench]]
-name = "crl_reload"
-harness = false
-
-[[bench]]
 name = "crl_reload_real"
 harness = false
 

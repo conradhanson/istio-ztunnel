@@ -61,7 +61,7 @@ use ztunnel::identity::{DEFAULT_TRUST_DOMAIN, Identity};
 use ztunnel::setup_netns_test;
 use ztunnel::test_helpers::linux::{TestMode, WorkloadManager};
 use ztunnel::test_helpers::tcp::{Mode, TestServer};
-use ztunnel::tls::mock::crl_pem_revoking_cert;
+use ztunnel::tls::mock::crl_pem_revoking_certs;
 
 // The ctor must run before any tokio runtime — it unshares the user/net/mount namespaces.
 #[ctor::ctor(unsafe)]
@@ -423,8 +423,12 @@ async fn run_cycles(ctx: Ctx) -> Report {
         expected_closes += want;
         let t0 = Instant::now();
         revoked.extend(ctx.batches[cycle].iter().cloned());
-        // CRL revokes every serial so far; CrlManager unions same-issuer CRL blocks.
-        let pem: String = revoked.iter().map(|s| crl_pem_revoking_cert(s)).collect();
+        // One cumulative CRL listing every serial revoked so far — not one single-entry CRL per
+        // victim concatenated together. webpki's revocation check picks the *first* CRL it finds
+        // authoritative for a cert's issuer rather than unioning multiple same-issuer CRLs, so all
+        // of our (single-issuer) revocations must live in one CRL object, same as a real CA
+        // publishing one updated, cumulative CRL rather than a pile of disjoint fragments.
+        let pem = crl_pem_revoking_certs(&revoked);
         if std::fs::write(&ctx.crl_path, pem).is_err() {
             break;
         }
@@ -544,19 +548,19 @@ fn main() {
     );
     let manager = setup_netns_test!(TestMode::Shared);
 
-    let setup_rt = tokio::runtime::Builder::new_current_thread()
+    // `setup()` spawns long-lived tasks (notably the mock CNI/inpod-agent server backing each
+    // deployed ztunnel — see `start_ztunnel_server`) that attach to whatever runtime is currently
+    // executing. Those tasks must stay alive for the whole bench, so `setup()` and `run_cycles()`
+    // share one runtime here rather than `setup()` running on a separate runtime that gets dropped
+    // (which previously killed the mock CNI server right after setup, breaking every cycle after
+    // whichever ones snuck in before the runtime finished tearing down).
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let (ctx, _manager, _handles) = setup_rt
+    let (ctx, _manager, _handles) = rt
         .block_on(setup(manager, params))
         .expect("real-stack CRL bench setup failed");
-    drop(setup_rt);
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
     let mut report = rt.block_on(run_cycles(ctx));
 
     report.lats.sort_unstable();
