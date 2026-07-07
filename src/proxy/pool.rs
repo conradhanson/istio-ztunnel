@@ -106,6 +106,8 @@ impl ConnSpawner {
                 ssl,
                 crl_manager.clone(),
                 self.metrics.clone(),
+                cert.root_store(),
+                webpki::KeyUsage::server_auth(),
             )
         });
         let sender = h2::client::spawn_connection(

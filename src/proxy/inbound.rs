@@ -14,13 +14,14 @@
 
 use futures_util::TryFutureExt;
 use http::{Method, Response, StatusCode};
+use rustls::CommonState;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 use tls_listener::AsyncTls;
 use tokio::sync::watch;
 
-use tracing::{Instrument, debug, error, info, info_span, trace_span};
+use tracing::{Instrument, debug, error, info, info_span, trace_span, warn};
 
 use super::{
     ConnectionResult, ConnectionResultBuilder, Error, HboneAddress, LocalWorkloadInformation,
@@ -153,14 +154,12 @@ impl Inbound {
                     // The revocation state owns the per-connection signal that `serve_connection`
                     // sets when this peer's cert is revoked; each stream's serving future watches a
                     // receiver of it so the access log attributes the termination (mirrors the RBAC
-                    // late-rejection drain).
-                    let revocation = pi.crl_manager.as_ref().map(|crl_manager| {
-                        h2::revocation::ConnectionRevocation::new(
-                            ssl,
-                            crl_manager.clone(),
-                            pi.metrics.clone(),
-                        )
-                    });
+                    // late-rejection drain). Re-checking revocation reuses the same webpki
+                    // chain-validation path as the handshake, so it needs our own cert's trust
+                    // anchors alongside the peer chain already captured from `ssl`. Boxed so the
+                    // `fetch_certificate` await doesn't inline its state into `serve_client` (this
+                    // future must stay small — see the assertion below).
+                    let revocation = Box::pin(Self::build_revocation(&pi, ssl)).await;
                     let revoked_rx = revocation.as_ref().map(|r| r.subscribe_revoked());
                     let request_handler = move |req| {
                         let id = Self::extract_traceparent(&req);
@@ -205,6 +204,29 @@ impl Inbound {
             accept,
         )
         .await
+    }
+
+    /// Builds this connection's CRL revocation state, or `None` when CRL enforcement is disabled.
+    /// Kept as its own `async fn` (and boxed at the call site) so the `fetch_certificate` await
+    /// doesn't grow the size of the caller's future.
+    async fn build_revocation(
+        pi: &ProxyInputs,
+        ssl: &CommonState,
+    ) -> Option<Box<h2::revocation::ConnectionRevocation>> {
+        let crl_manager = pi.crl_manager.as_ref()?;
+        match pi.local_workload_information.fetch_certificate().await {
+            Ok(cert) => Some(h2::revocation::ConnectionRevocation::new(
+                ssl,
+                crl_manager.clone(),
+                pi.metrics.clone(),
+                cert.root_store(),
+                webpki::KeyUsage::client_auth(),
+            )),
+            Err(e) => {
+                warn!("failed to fetch certificate for CRL revocation enforcement: {e}");
+                None
+            }
+        }
     }
 
     fn extract_traceparent(req: &H2Request) -> TraceParent {

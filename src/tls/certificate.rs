@@ -107,33 +107,6 @@ pub fn identities(cert: X509Certificate) -> Result<Vec<Identity>, Error> {
     Ok(Vec::default())
 }
 
-/// A minimal revocation identity for one certificate: its DER-encoded issuer `Name` and raw serial
-/// number — exactly the pair a CRL revokes by. We retain only these per existing connection (not
-/// the full chain) to enforce CRL revocation cheaply; see [`crate::tls::crl::CrlManager::any_revoked`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CertId {
-    /// DER bytes of the certificate's issuer `Name`, matched against a CRL's issuer.
-    pub issuer: Vec<u8>,
-    /// Raw serial number bytes.
-    pub serial: Vec<u8>,
-}
-
-/// Extracts the [`CertId`] of every certificate in a peer chain (leaf first). Unparseable certs are
-/// skipped — they could not have been accepted at handshake, so they cannot be the revoked cert.
-pub fn chain_cert_ids(chain: &[CertificateDer<'_>]) -> Vec<CertId> {
-    chain
-        .iter()
-        .filter_map(|der| {
-            x509_parser::parse_x509_certificate(der)
-                .ok()
-                .map(|(_, c)| CertId {
-                    issuer: c.tbs_certificate.issuer.as_raw().to_vec(),
-                    serial: c.tbs_certificate.raw_serial().to_vec(),
-                })
-        })
-        .collect()
-}
-
 impl Certificate {
     // TODO: I would love to parse this once, but ran into lifetime issues.
     fn parsed(&self) -> X509Certificate<'_> {
@@ -305,6 +278,13 @@ impl WorkloadCertificate {
 
     pub fn identity(&self) -> Option<Identity> {
         self.cert.identity()
+    }
+
+    /// The trust anchors this certificate chains to. Used to re-run the shared webpki
+    /// chain-validation path ([`crate::tls::verifier::verify_cert_chain`]) against a peer chain
+    /// captured at handshake time, e.g. to re-check CRL revocation on an existing connection.
+    pub fn root_store(&self) -> Arc<RootCertStore> {
+        self.root_store.clone()
     }
 
     // TODO: can we precompute some or all of this?
@@ -658,46 +638,5 @@ mod test {
             .await
             .expect_err("connection should fail: intermediate cert is revoked");
         assert!(io_error_is_cert_revoked(&err));
-    }
-
-    /// Strategy A for existing-connection enforcement: retain only `(issuer, serial)` per chain
-    /// cert and check membership via `CrlManager::any_revoked`. Must report revocation iff the
-    /// cert's serial is revoked under its issuer, and never false-positive on an unrelated CRL.
-    #[test]
-    fn any_revoked_matches_chain_cert_ids() {
-        use crate::tls::chain_cert_ids;
-        use crate::tls::crl::CrlManager;
-
-        let id = Identity::from_str("spiffe://td/ns/n/sa/a").unwrap();
-        let (key, cert) = crate::tls::mock::generate_test_certs_with_root(
-            &TestIdentity::Identity(id.clone()),
-            SystemTime::now(),
-            SystemTime::now() + Duration::from_secs(3600),
-            None,
-            TEST_ROOT_KEY,
-        );
-        let wl =
-            WorkloadCertificate::new(key.as_bytes(), cert.as_bytes(), vec![TEST_ROOT]).unwrap();
-        let ids = chain_cert_ids(&wl.cert_and_intermediates_der());
-        assert!(!ids.is_empty(), "chain must yield at least the leaf id");
-
-        let write_mgr = |pem: &str| {
-            let mut f = NamedTempFile::new().unwrap();
-            f.write_all(pem.as_bytes()).unwrap();
-            f.flush().unwrap();
-            CrlManager::new(f.path().to_path_buf()).unwrap()
-        };
-
-        // CRL revoking this cert's serial: reported revoked.
-        let revoking = write_mgr(&crl_pem_revoking_cert(&wl.cert.serial_bytes()));
-        assert!(revoking.any_revoked(&ids));
-
-        // CRL revoking an unrelated serial: not revoked.
-        let unrelated = write_mgr(&crl_pem_revoking_cert(&[9, 9, 9, 9]));
-        assert!(!unrelated.any_revoked(&ids));
-
-        // Empty CRL: not revoked.
-        let empty = CrlManager::new(NamedTempFile::new().unwrap().path().to_path_buf()).unwrap();
-        assert!(!empty.any_revoked(&ids));
     }
 }

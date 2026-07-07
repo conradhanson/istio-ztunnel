@@ -298,6 +298,8 @@ impl OutboundConnection {
                     ssl,
                     crl_manager.clone(),
                     self.pi.metrics.clone(),
+                    cert.root_store(),
+                    webpki::KeyUsage::server_auth(),
                 )
             });
             let mut sender = super::h2::client::spawn_connection(
